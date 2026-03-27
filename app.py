@@ -3,17 +3,16 @@ import cv2
 import numpy as np
 import joblib
 import os
-import tempfile
 from skimage.feature import hog
+import time
 
-# --- Cấu hình & Load Model ---
+# --- Cấu hình hệ thống ---
 MODEL_DIR = 'models'
 IMG_SIZE = (64, 64)
 N_FRAMES = 12
 CLASSES = ['Boxing', 'Handclapping', 'Handwaving', 'Jogging', 'Running', 'Walking']
-COLORS = [(255, 0, 0), (255, 255, 0), (0, 255, 255), (255, 165, 0), (0, 0, 255), (0, 255, 0)]
 
-# Load bộ 3 file model (Đảm bảo đã push lên GitHub)
+# --- Load Models (Sử dụng Cache để mượt hơn) ---
 @st.cache_resource
 def load_models():
     scaler = joblib.load(os.path.join(MODEL_DIR, 'scaler.pkl'))
@@ -24,7 +23,7 @@ def load_models():
 try:
     scaler, pca, model = load_models()
 except Exception as e:
-    st.error(f"Lỗi load model: {e}. Hãy đảm bảo thư mục models/ có đủ 3 file .pkl")
+    st.error(f"❌ Không tìm thấy Model! Admin hãy kiểm tra thư mục {MODEL_DIR}")
 
 def extract_mhi(frames, decay=0.6):
     mhi = np.zeros(IMG_SIZE, dtype=np.float32)
@@ -35,36 +34,56 @@ def extract_mhi(frames, decay=0.6):
     return mhi
 
 # --- GIAO DIỆN STREAMLIT ---
-st.set_page_config(page_title="Action Recognition DUT", layout="wide")
-st.title("🚀 Hệ thống Nhận diện Hành động Người (KTH Dataset)")
-st.sidebar.header("Cấu hình")
-confidence_threshold = st.sidebar.slider("Ngưỡng tin cậy (%)", 0, 100, 50)
+st.set_page_config(page_title="DUT Action AI - Localhost", layout="wide")
 
-uploaded_file = st.file_uploader("Chọn video hành động (mp4, avi)...", type=["mp4", "avi", "mov"])
+st.markdown("""
+    <style>
+    .main { background-color: #f0f2f6; }
+    .stTitle { color: #1E3A8A; font-family: 'Segoe UI'; }
+    </style>
+    """, unsafe_allow_html=True)
 
-if uploaded_file is not None:
-    # Lưu file tạm để OpenCV đọc được
-    tfile = tempfile.NamedTemporaryFile(delete=False)
-    tfile.write(uploaded_file.read())
-    
-    cap = cv2.VideoCapture(tfile.name)
-    st_frame = st.empty() # Khung hiển thị video
-    st_label = st.sidebar.empty() # Khung hiển thị kết quả
-    
+st.title("🤖 Nhận diện Hành động Real-time (Localhost)")
+st.caption("Đồ án tốt nghiệp - Khoa Công nghệ Thông tin - DUT")
+
+# Sidebar
+st.sidebar.header("⚙️ Cấu hình Webcam")
+run_webcam = st.sidebar.checkbox('Bật Camera', value=False)
+conf_threshold = st.sidebar.slider("Ngưỡng tin cậy (%)", 0, 100, 40)
+show_mhi = st.sidebar.checkbox('Hiển thị MHI (Vết chuyển động)')
+
+# Layout chính
+col1, col2 = st.columns([2, 1])
+
+with col1:
+    st_frame = st.empty() # Khung video chính
+
+with col2:
+    st.write("### 📊 Kết quả phân tích")
+    st_label = st.empty()
+    st_probs = st.empty()
+    st_mhi_view = st.empty()
+
+# --- XỬ LÝ WEBCAM ---
+if run_webcam:
+    cap = cv2.VideoCapture(0) # Mở Webcam local
     frames_buffer = []
     
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret: break
         
-        # Tiền xử lý
-        frame_display = cv2.resize(frame, (640, 480))
+        # Lật ảnh cho giống gương
+        frame = cv2.flip(frame, 1)
+        frame_out = cv2.resize(frame, (640, 480))
+        
+        # Tiền xử lý cho Model
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         resized = cv2.resize(gray, IMG_SIZE)
         frames_buffer.append(resized)
         
         if len(frames_buffer) == N_FRAMES:
-            # 1. Trích xuất HOG tại 3 mốc
+            # 1. Trích xuất HOG (3 mốc thời gian)
             indices = [0, N_FRAMES//2, -1]
             hog_parts = [hog(frames_buffer[idx], orientations=12, pixels_per_cell=(8,8), 
                              cells_per_block=(2,2), block_norm='L2-Hys') for idx in indices]
@@ -74,30 +93,40 @@ if uploaded_file is not None:
             hog_mhi = hog(mhi_img, orientations=12, pixels_per_cell=(8,8), 
                           cells_per_block=(2,2), block_norm='L2-Hys')
             
-            # 3. Dự đoán
+            # 3. Predict
             features = np.concatenate([*hog_parts, hog_mhi]).reshape(1, -1)
-            feat_scaled = scaler.transform(features)
-            feat_pca = pca.transform(feat_scaled)
+            feat_pca = pca.transform(scaler.transform(features))
             
             probs = model.predict_proba(feat_pca)[0]
             max_idx = np.argmax(probs)
-            confidence = probs[max_idx] * 100
+            score = probs[max_idx] * 100
             
-            # Hiển thị kết quả nếu vượt ngưỡng
-            if confidence >= confidence_threshold:
+            # 4. Hiển thị lên UI
+            if score >= conf_threshold:
                 label = CLASSES[max_idx]
-                color = (0, 255, 0)
-                cv2.putText(frame_display, f"{label} ({confidence:.1f}%)", (20, 50), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
+                cv2.putText(frame_out, f"{label} {score:.1f}%", (20, 50), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
                 
-                # Hiển thị biểu đồ ở sidebar
-                st_label.write(f"### Dự đoán: **{label}**")
-                st_label.progress(int(confidence))
+                st_label.markdown(f"## Hành động: **{label}**")
+                # Vẽ biểu đồ xác suất đơn giản
+                st_probs.bar_chart({CLASSES[i]: probs[i] for i in range(len(CLASSES))})
             
+            if show_mhi:
+                # Chuẩn hóa MHI để hiển thị
+                mhi_vis = cv2.normalize(mhi_img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+                st_mhi_view.image(mhi_vis, caption="Motion History Image (MHI)", width=200)
+
             frames_buffer.pop(0) # Sliding window
 
-        # Render frame lên Streamlit (Thay cho cv2.imshow)
-        st_frame.image(frame_display, channels="BGR")
+        # Đẩy frame lên trình duyệt
+        st_frame.image(frame_out, channels="BGR")
         
+        # Tránh quá tải CPU
+        time.sleep(0.01)
+        
+        if not run_webcam:
+            break
+            
     cap.release()
-    st.success("Đã xử lý xong video!")
+else:
+    st_frame.info("Nhấn 'Bật Camera' ở thanh bên trái để bắt đầu demo.")
