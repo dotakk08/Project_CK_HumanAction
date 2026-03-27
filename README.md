@@ -152,8 +152,6 @@ Confusion matrix của mô hình trên tập kiểm thử:
 3. Đặt **Main file path** là `app.py`
 4. Nhấn **Deploy**
 
----
 
-## 📄 License
 
-Dự án phục vụ mục đích học thuật — Đồ án cuối kỳ môn Thị giác Máy tính / Xử lý ảnh.
+
