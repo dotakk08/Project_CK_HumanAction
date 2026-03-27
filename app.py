@@ -1,92 +1,103 @@
+import streamlit as st
 import cv2
 import numpy as np
 import joblib
 import os
+import tempfile
 from skimage.feature import hog
 
-# --- Cấu hình hệ thống ---
+# --- Cấu hình & Load Model ---
 MODEL_DIR = 'models'
 IMG_SIZE = (64, 64)
 N_FRAMES = 12
 CLASSES = ['Boxing', 'Handclapping', 'Handwaving', 'Jogging', 'Running', 'Walking']
-COLORS = [(0,0,255), (0,255,255), (255,255,0), (0,165,255), (255,0,0), (0,255,0)]
+COLORS = [(255, 0, 0), (255, 255, 0), (0, 255, 255), (255, 165, 0), (0, 0, 255), (0, 255, 0)]
 
-# Load bộ 3 file đã train từ ổ D hoặc Colab
-scaler = joblib.load(os.path.join(MODEL_DIR, 'scaler.pkl'))
-pca = joblib.load(os.path.join(MODEL_DIR, 'pca.pkl'))
-model = joblib.load(os.path.join(MODEL_DIR, 'svm_kth.pkl'))
+# Load bộ 3 file model (Đảm bảo đã push lên GitHub)
+@st.cache_resource
+def load_models():
+    scaler = joblib.load(os.path.join(MODEL_DIR, 'scaler.pkl'))
+    pca = joblib.load(os.path.join(MODEL_DIR, 'pca.pkl'))
+    model = joblib.load(os.path.join(MODEL_DIR, 'svm_kth.pkl'))
+    return scaler, pca, model
 
-def draw_bar_chart(frame, probs):
-    """Vẽ biểu đồ xác suất các hành động lên màn hình"""
-    for i, p in enumerate(probs):
-        width = int(p * 150)
-        cv2.rectangle(frame, (10, 60 + i*30), (10 + width, 80 + i*30), COLORS[i], -1)
-        cv2.putText(frame, f"{CLASSES[i]}: {p*100:.1f}%", (10, 75 + i*30), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+try:
+    scaler, pca, model = load_models()
+except Exception as e:
+    st.error(f"Lỗi load model: {e}. Hãy đảm bảo thư mục models/ có đủ 3 file .pkl")
 
-def run_demo(video_source=0):
-    cap = cv2.VideoCapture(video_source)
-    frames_buffer = []
+def extract_mhi(frames, decay=0.6):
+    mhi = np.zeros(IMG_SIZE, dtype=np.float32)
+    for i in range(1, len(frames)):
+        diff = cv2.absdiff(frames[i], frames[i-1])
+        _, thresh = cv2.threshold(diff, 20, 1, cv2.THRESH_BINARY)
+        mhi = np.maximum(mhi * decay, thresh.astype(np.float32))
+    return mhi
 
-    print("--- Đang khởi động Demo (Nhấn 'q' để thoát) ---")
+# --- GIAO DIỆN STREAMLIT ---
+st.set_page_config(page_title="Action Recognition DUT", layout="wide")
+st.title("🚀 Hệ thống Nhận diện Hành động Người (KTH Dataset)")
+st.sidebar.header("Cấu hình")
+confidence_threshold = st.sidebar.slider("Ngưỡng tin cậy (%)", 0, 100, 50)
+
+uploaded_file = st.file_uploader("Chọn video hành động (mp4, avi)...", type=["mp4", "avi", "mov"])
+
+if uploaded_file is not None:
+    # Lưu file tạm để OpenCV đọc được
+    tfile = tempfile.NamedTemporaryFile(delete=False)
+    tfile.write(uploaded_file.read())
     
-    while True:
+    cap = cv2.VideoCapture(tfile.name)
+    st_frame = st.empty() # Khung hiển thị video
+    st_label = st.sidebar.empty() # Khung hiển thị kết quả
+    
+    frames_buffer = []
+    
+    while cap.isOpened():
         ret, frame = cap.read()
         if not ret: break
         
-        # Tiền xử lý hiển thị
-        display_frame = cv2.flip(frame, 1) # Soi gương cho dễ nhìn
-        gray = cv2.cvtColor(display_frame, cv2.COLOR_BGR2GRAY)
+        # Tiền xử lý
+        frame_display = cv2.resize(frame, (640, 480))
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         resized = cv2.resize(gray, IMG_SIZE)
         frames_buffer.append(resized)
-
+        
         if len(frames_buffer) == N_FRAMES:
-            # 1. Trích xuất đặc trưng (HOG + MHI)
+            # 1. Trích xuất HOG tại 3 mốc
             indices = [0, N_FRAMES//2, -1]
-            hog_features = []
-            for idx in indices:
-                fd = hog(frames_buffer[idx], orientations=12, pixels_per_cell=(8,8), 
-                         cells_per_block=(2,2), block_norm='L2-Hys')
-                hog_features.append(fd)
+            hog_parts = [hog(frames_buffer[idx], orientations=12, pixels_per_cell=(8,8), 
+                             cells_per_block=(2,2), block_norm='L2-Hys') for idx in indices]
             
-            # Tính MHI (Motion History Image)
-            mhi = np.zeros(IMG_SIZE, dtype=np.float32)
-            for i in range(1, len(frames_buffer)):
-                diff = cv2.absdiff(frames_buffer[i], frames_buffer[i-1])
-                _, thresh = cv2.threshold(diff, 25, 1, cv2.THRESH_BINARY)
-                mhi = np.maximum(mhi * 0.7, thresh.astype(np.float32))
-            
-            mhi_hog = hog(mhi, orientations=12, pixels_per_cell=(8,8), 
+            # 2. Trích xuất MHI
+            mhi_img = extract_mhi(frames_buffer)
+            hog_mhi = hog(mhi_img, orientations=12, pixels_per_cell=(8,8), 
                           cells_per_block=(2,2), block_norm='L2-Hys')
             
-            # Hợp nhất đặc trưng
-            final_features = np.concatenate([*hog_features, mhi_hog]).reshape(1, -1)
-            
-            # 2. Dự đoán với Scaler và PCA
-            feat_scaled = scaler.transform(final_features)
+            # 3. Dự đoán
+            features = np.concatenate([*hog_parts, hog_mhi]).reshape(1, -1)
+            feat_scaled = scaler.transform(features)
             feat_pca = pca.transform(feat_scaled)
             
-            # Lấy xác suất của tất cả các lớp
             probs = model.predict_proba(feat_pca)[0]
-            pred_idx = np.argmax(probs)
+            max_idx = np.argmax(probs)
+            confidence = probs[max_idx] * 100
             
-            # 3. Vẽ giao diện
-            label = f"PREDICTION: {CLASSES[pred_idx].upper()}"
-            cv2.rectangle(display_frame, (0,0), (350, 250), (0,0,0), -1) # Khung đen nền
-            cv2.putText(display_frame, label, (10, 40), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            # Hiển thị kết quả nếu vượt ngưỡng
+            if confidence >= confidence_threshold:
+                label = CLASSES[max_idx]
+                color = (0, 255, 0)
+                cv2.putText(frame_display, f"{label} ({confidence:.1f}%)", (20, 50), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
+                
+                # Hiển thị biểu đồ ở sidebar
+                st_label.write(f"### Dự đoán: **{label}**")
+                st_label.progress(int(confidence))
             
-            draw_bar_chart(display_frame, probs)
-            
-            # Trượt cửa sổ (Sliding window)
-            frames_buffer.pop(0)
+            frames_buffer.pop(0) # Sliding window
 
-        cv2.imshow('KTH ACTION RECOGNITION - DUT Senior Project', display_frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'): break
-
+        # Render frame lên Streamlit (Thay cho cv2.imshow)
+        st_frame.image(frame_display, channels="BGR")
+        
     cap.release()
-    cv2.destroyAllWindows()
-
-if __name__ == '__main__':
-    # Thay 0 bằng link file .avi nếu muốn test video có sẵn
-    run_demo(0)
+    st.success("Đã xử lý xong video!")
