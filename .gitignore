@@ -1,0 +1,6 @@
+features/
+models/
+data/
+*.npy
+*.pkl
+.venv/
