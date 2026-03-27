@@ -1,6 +1,6 @@
 features/
-models/
+#models/
 data/
 *.npy
-*.pkl
+#*.pkl
 .venv/
